@@ -1,0 +1,57 @@
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Editor / IDE =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ===== Env / Secrets =====
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets/
+
+# ===== PHP =====
+/vendor/
+composer.phar
+composer.lock
+.phpunit.result.cache
+phpunit.xml
+.php-cs-fixer.cache
+
+# ===== Go =====
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+# Test binary and coverage
+*.test
+*.out
+coverage.txt
+coverage.html
+# Go workspace
+go.work
+go.work.sum
+# Vendor (可选，视项目决定)
+# /vendor/
+
+# ===== Node (若引入 VitePress/Docsify 等静态站) =====
+node_modules/
+dist/
+.cache/
+*.log
+
+# ===== 临时文件 =====
+tmp/
+temp/
+*.bak
+*.tmp
