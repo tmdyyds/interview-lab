@@ -2,6 +2,10 @@
 
 每个模式建议 PHP + Go 双实现，加深印象。
 
+## 已收录
+
+- [common-patterns-php-go.md](./common-patterns-php-go.md) — 10 个最常用模式(单例/工厂/建造者/Options/适配器/装饰器/外观/策略/观察者/责任链) PHP + Go 双实现 + 调用示例
+
 ## 计划收录
 
 ### 创建型

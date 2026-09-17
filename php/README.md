@@ -11,6 +11,7 @@ PHP 相关的所有内容集中在这里：语言特性、框架源码、生态�
 - [frameworks/](./frameworks/README.md) — 框架：Laravel、Hyperf、Symfony
 - [ecosystem/](./ecosystem/README.md) — 生态：Swoole、Guzzle、Composer、PSR
 - [questions.md](./questions.md) — 高频面试题索引
+- [interview-answers.md](./interview-answers.md) — 28 道高频面试题完整解答（基础/OOP/高级/性能/框架/生态 全覆盖）
 
 ## 学习路径建议
 

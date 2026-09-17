@@ -1,5 +1,9 @@
 # 消息队列
 
+## 已收录
+
+- [rabbitmq.md](./rabbitmq.md) — RabbitMQ 基础与重点(AMQP / 四种 Exchange / 可靠性三件套 / DLX / 延迟队列 / Prefetch / 集群 / 顺序 / 幂等 / 堆积 / PHP&Go 代码示例 / 15 道面试题)
+
 ## 计划收录
 
 - **Kafka**

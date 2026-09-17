@@ -1,5 +1,9 @@
 # MySQL
 
+## 已收录
+
+- [interview-and-scenarios.md](./interview-and-scenarios.md) — 60 道高频面试题（存储引擎/索引/事务/锁/日志/主从/SQL 优化）+ 10 个生产场景实战（分库分表 / 深分页 / Online DDL / 死锁 / 慢查询 / 幂等 / 归档 / 主从延迟 / Snowflake / 乐观锁 vs 悲观锁）
+
 ## 计划收录
 
 - **存储引擎**：InnoDB vs MyISAM

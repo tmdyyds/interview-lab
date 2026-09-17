@@ -539,6 +539,237 @@ $around = $board->getAroundMe('shop:1001', 2);
 
 ---
 
+### 进阶：同分排名 + 分页问题（生产必踩）
+
+上面的实现有两个隐藏坑：
+
+1. **同分排序诡异**：多个玩家分数一样时，ZSet 按 member 字典序排（`shop:1002` 比 `shop:1001` 排前）。业务上一般期望"先达到该分数的排在前面"
+2. **分页数据错乱**：分页时如果有玩家分数变化，可能重复或漏掉
+
+#### 问题演示
+
+```
+ZSet 数据：
+member          score
+player_005      100      ← 后提交
+player_002      100      
+player_009      100      ← 先提交
+player_003      100
+
+Redis 默认排序（同分按字典序倒序）：
+1. player_009
+2. player_005
+3. player_003
+4. player_002
+   ↑ 完全不是业务需要的"先来先排"
+```
+
+**分页并发错乱**：
+
+```
+第 1 页取完 [player_009, player_005] 之后，
+player_010 加入 100 分 → 插入到 player_009 之前
+
+第 2 页（offset 2-3）：
+  ["player_005", "player_003"]
+    ↑ player_005 重复了！player_010 被跳过
+```
+
+#### 解决方案：复合 Score（Score 编码时间戳）
+
+**核心思路**：把"提交时间戳"塞进 score，保证 score 唯一 + 同分先提交的排前面。
+
+```
+combined_score = raw_score × 大乘数 - timestamp
+```
+
+- 乘数把真实分数放到高位（保证分数差异远大于时间戳）
+- **减去时间戳**：先提交的时间戳小，减出来的数更大，score 更高 → 排名靠前
+
+#### PHP 完整实现
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Leaderboard;
+
+use Redis;
+
+/**
+ * 复合分数排行榜（解决同分排序 + 分页稳定问题）
+ * 
+ * score 结构：raw_score × MULTIPLIER - timestamp
+ *   - 高位：真实分数（决定主排序）
+ *   - 低位：时间戳的负数（同分时先提交的排前）
+ */
+class StableLeaderboard
+{
+    // 分数乘数（要大于时间戳量级）
+    // 毫秒时间戳约 13 位（1.7e12），乘数用 1e13 支持 raw_score < 900
+    // 如果 raw_score 可能超过 900，用秒时间戳（10 位）+ 乘数 1e10 支持 < 9_000_000
+    private const MULTIPLIER = 10_000_000_000_000; // 1e13（毫秒时间戳）
+
+    public function __construct(
+        private Redis $redis,
+        private string $key = 'stable_leaderboard'
+    ) {
+    }
+
+    /** 覆盖式设置分数 */
+    public function setScore(string $memberId, int $rawScore): void
+    {
+        $timestamp = (int) (microtime(true) * 1000); // 毫秒
+        $combined = $rawScore * self::MULTIPLIER - $timestamp;
+        $this->redis->zAdd($this->key, $combined, $memberId);
+    }
+
+    /** 增加分数（Lua 原子：读旧的 raw_score + delta + 新时间戳重算） */
+    public function addScore(string $memberId, int $delta): int
+    {
+        $lua = <<<'LUA'
+            local key = KEYS[1]
+            local member = ARGV[1]
+            local delta = tonumber(ARGV[2])
+            local multiplier = tonumber(ARGV[3])
+            local timestamp = tonumber(ARGV[4])
+
+            local old_score = tonumber(redis.call('ZSCORE', key, member))
+            local old_raw = 0
+            if old_score ~= nil then
+                old_raw = math.floor(old_score / multiplier)
+            end
+
+            local new_raw = old_raw + delta
+            local new_score = new_raw * multiplier - timestamp
+            redis.call('ZADD', key, new_score, member)
+            return new_raw
+        LUA;
+
+        $timestamp = (int) (microtime(true) * 1000);
+        return $this->redis->eval(
+            $lua,
+            [$this->key, $memberId, (string) $delta, (string) self::MULTIPLIER, (string) $timestamp],
+            1
+        );
+    }
+
+    /** 从 combined score 还原真实分数 */
+    private function decodeRawScore(float $combined): int
+    {
+        return (int) ($combined / self::MULTIPLIER);
+    }
+
+    /** 从 combined score 还原提交时间戳（毫秒） */
+    private function decodeTimestamp(float $combined): int
+    {
+        $rawScore = $this->decodeRawScore($combined);
+        return (int) ($rawScore * self::MULTIPLIER - $combined);
+    }
+
+    /**
+     * 分页查询（稳定，同分按提交时间排）
+     * 
+     * @return array [['member' => xxx, 'raw_score' => 100, 'timestamp' => 123, 'rank' => 1], ...]
+     */
+    public function page(int $page, int $pageSize): array
+    {
+        $start = ($page - 1) * $pageSize;
+        $end = $start + $pageSize - 1;
+
+        $raw = $this->redis->zRevRange($this->key, $start, $end, true);
+
+        $result = [];
+        $rank = $start + 1;
+        foreach ($raw as $memberId => $combined) {
+            $result[] = [
+                'member' => $memberId,
+                'raw_score' => $this->decodeRawScore((float) $combined),
+                'timestamp' => $this->decodeTimestamp((float) $combined),
+                'rank' => $rank++,
+            ];
+        }
+        return $result;
+    }
+
+    /** 查询某人排名 */
+    public function getRank(string $memberId): ?int
+    {
+        $rank = $this->redis->zRevRank($this->key, $memberId);
+        return $rank === false ? null : $rank + 1; // 1-based
+    }
+
+    /** 查询某人的真实分数 */
+    public function getScore(string $memberId): ?int
+    {
+        $combined = $this->redis->zScore($this->key, $memberId);
+        return $combined === false ? null : $this->decodeRawScore((float) $combined);
+    }
+}
+
+// ====================================================================
+// 使用示例
+// ====================================================================
+
+$redis = new Redis();
+$redis->connect('127.0.0.1', 6379);
+$board = new StableLeaderboard($redis, 'game:daily');
+
+// 提交分数（时间顺序：003 → 009 → 002 → 005）
+$board->setScore('player_003', 100);
+usleep(1000);
+$board->setScore('player_009', 100);
+usleep(1000);
+$board->setScore('player_002', 100);
+usleep(1000);
+$board->setScore('player_005', 100);
+
+// 查排行榜：先提交的排前面 ✅
+$page1 = $board->page(1, 10);
+// [
+//   ['member' => 'player_003', 'raw_score' => 100, 'rank' => 1],  ← 最先提交
+//   ['member' => 'player_009', 'raw_score' => 100, 'rank' => 2],
+//   ['member' => 'player_002', 'raw_score' => 100, 'rank' => 3],
+//   ['member' => 'player_005', 'raw_score' => 100, 'rank' => 4],  ← 最后提交
+// ]
+
+// 累加分数
+$newScore = $board->addScore('player_003', 50); // 100 + 50 = 150
+// player_003 移到前面（同分内也会更新时间戳）
+```
+
+#### 精度限制
+
+Redis score 是 float64（52 位尾数），最大精确整数约 **2^53 ≈ 9 × 10^15**。
+
+| 分数上限 | 推荐乘数 | 时间戳精度 |
+|--------|--------|----------|
+| < 900 | 1e13 | 毫秒（更精确的同分排序） |
+| < 90 000 | 1e11 | 毫秒 |
+| < 9 000 000 | 1e9 | 秒 |
+| < 900 000 000 | 1e7 | 秒 |
+
+**超出精度会导致排序失灵**，选乘数时务必留 10 倍余量。
+
+#### 面试追问
+
+**Q: 除了复合 score，还有什么办法？**
+
+- **游标分页（Cursor Pagination）**：用上一页最后一条的 `(score, member)` 作为下一页起点，用 `ZRangeByScore` 配合 `WITHSCORES` 实现。**分页稳定但无法跳页**（只能翻下一页）
+- **Snowflake ID 塞进 member**：`member = "snowflake_id:user_id"`，同分按 member 字典序天然按提交时间排。**代价是 member 变长，查询要额外解析**
+
+**Q: 什么场景不适合复合 score？**
+
+- 分数可能非常大（10^10 以上）且需要毫秒精度 → 精度不够
+- 需要频繁修改历史提交时间 → 每次都要重算 combined score
+
+**Q: 分页跳页也要稳定怎么办？**
+
+复合 score 已经能保证分页稳定（同 score 内也有严格顺序）。真正跳页错乱只发生在**同 score 大量密集写入**的极端场景，此时需要在应用层加锁或用分布式快照（如 Redis 5+ 的 `SUBSCRIBE + XADD` stream 版本）。
+
+---
+
 ## 四、分布式 Session
 
 ### 场景
