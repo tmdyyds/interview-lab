@@ -1,0 +1,33 @@
+# .dockerignore 决定哪些文件不会进入构建上下文（build context）。
+# 上下文越小，docker build 越快，也不会把敏感文件误打进镜像。
+
+# Git 相关
+.git
+.gitignore
+.gitattributes
+
+# 文档不参与构建
+*.md
+README*
+
+# 部署脚本、K8s YAML 只在集群里用，不进镜像
+k8s/
+Makefile
+
+# 本地构建产物
+bin/
+dist/
+tmp/
+
+# IDE 配置
+.idea/
+.vscode/
+*.swp
+
+# 环境变量文件（本地用，避免误提交/误打包）
+.env
+.env.*
+
+# Dockerfile 自己
+Dockerfile
+.dockerignore

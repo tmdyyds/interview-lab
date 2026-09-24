@@ -18,11 +18,11 @@ Go runtime 是让 Go 从"简单语法"变成"高并发神器"的核心。**几�
 | [02. GC 与写屏障](./02-gc-and-write-barrier.md) | 三色标记、混合写屏障、GC 触发时机、STW 演进 | ⭐⭐⭐⭐⭐ |
 | [03. 内存分配器](./03-memory-allocator.md) | mcache/mcentral/mheap、Size Class、大对象分配 | ⭐⭐⭐⭐ |
 | [04. 逃逸分析](./04-escape-analysis.md) | 栈 vs 堆、逃逸规则、优化技巧 | ⭐⭐⭐ |
+| [05. Goroutine 栈机制](./05-goroutine-stack.md) | 连续栈、morestack/copystack、指针修正、栈缩容、g0 栈 | ⭐⭐⭐⭐ |
+| [06. Channel 与 Select 源码](./06-channel-internals.md) | hchan、sudog、直接传递、close 协议、selectgo 三阶段、随机性 | ⭐⭐⭐⭐ |
 
 ### 🟡 二梯队 · 大厂高频（待完成）
 
-- 05. Goroutine 栈机制（连续栈、扩容、收缩）
-- 06. Channel 底层实现（hchan、直接传递、select 随机化）
 - 07. sync 底层（Mutex 饥饿模式、Pool victim cache、Map 双 map）
 
 ### 🟢 三梯队 · 加分项（待完成）

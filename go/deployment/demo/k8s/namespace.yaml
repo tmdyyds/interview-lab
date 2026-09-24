@@ -1,0 +1,10 @@
+# Namespace 是 K8s 里最外层的隔离单位，
+# 一般每个业务/环境/租户一个 Namespace，方便做 RBAC、ResourceQuota、NetworkPolicy。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+  labels:
+    # 打个标签，后续 NetworkPolicy / Ingress selector 可以按 label 匹配
+    name: demo
+    env: prod

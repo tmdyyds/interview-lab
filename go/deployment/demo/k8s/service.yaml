@@ -1,0 +1,29 @@
+# Service 是 K8s 里给一组 Pod 提供稳定虚拟 IP + DNS 名的对象。
+#
+# 面试点：Service 是怎么把流量分发到 Pod 的？
+#   - kube-proxy 在每个 node 上维护 iptables / ipvs 规则，
+#     Cluster IP 的请求会被 DNAT 到某个后端 Pod。
+#   - 会话保持默认没有（每次随机），需要用 sessionAffinity: ClientIP。
+#
+# Service 类型：
+#   ClusterIP     只集群内可达，最常用（配合 Ingress 对外暴露）
+#   NodePort      每个节点的固定端口对外暴露，测试环境或简易方案
+#   LoadBalancer  云厂商自动创建 SLB / ELB，直接对外
+#   ExternalName  DNS CNAME，把外部域名映射进集群
+#   Headless      clusterIP: None，直接返回 Pod IP，StatefulSet 用得多
+apiVersion: v1
+kind: Service
+metadata:
+  name: go-k8s-demo
+  namespace: demo
+  labels:
+    app: go-k8s-demo
+spec:
+  type: ClusterIP
+  selector:
+    app: go-k8s-demo         # 选到有这个 label 的所有 Pod
+  ports:
+    - name: http
+      port: 80               # Service 端口
+      targetPort: http       # 用 port name 而不是数字，Deployment 改端口时不用同步改
+      protocol: TCP

@@ -1,0 +1,69 @@
+# HorizontalPodAutoscaler：根据指标自动伸缩副本数。
+#
+# 前置条件：
+#   - 集群装了 metrics-server（CPU/内存指标）
+#   - 或装了 Prometheus Adapter / KEDA（自定义指标，比如 QPS、Kafka lag）
+#
+# 面试点：HPA 计算副本数的公式
+#   desiredReplicas = ceil(currentReplicas * currentMetric / targetMetric)
+#   例：当前 3 副本 CPU 平均 90%，目标 60%，
+#       ceil(3 * 90/60) = ceil(4.5) = 5 → 扩到 5 副本
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: go-k8s-demo
+  namespace: demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: go-k8s-demo
+
+  minReplicas: 3               # 保底副本数，业务低峰时也不低于此值
+  maxReplicas: 20              # 上限，避免异常流量把成本打爆
+
+  # 多指标：任一超阈值就扩容，所有都低于阈值才缩容
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # 60% 是常见基准：留 40% 缓冲应对流量突增和滚动升级
+          # 太高（比如 90%）→ 扩容响应慢；太低（比如 30%）→ 浪费资源
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+  # ------------------------------------------------------------------
+  # 扩缩容行为（v2 才有，v1 没这个）
+  # ------------------------------------------------------------------
+  # 关键场景：流量抖动导致副本数上下震荡（"抖动"），带来：
+  #   - 频繁 Pod 启停消耗资源
+  #   - 服务预热被打断（连接池、JIT 缓存）
+  # 通过 behavior 控制扩缩容速率来避免。
+  behavior:
+    scaleUp:
+      # 稳定窗口：过去 15 秒内的最高推荐副本数生效，防止瞬时抖动
+      stabilizationWindowSeconds: 15
+      # 两条 policy 取 Max：15 秒内可以翻倍或加 4 个，哪个大用哪个
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+        - type: Pods
+          value: 4
+          periodSeconds: 15
+      selectPolicy: Max
+
+    scaleDown:
+      # 缩容要"慢"：稳定窗口 5 分钟，避免瞬时低谷就缩容然后又扩回来
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 20                # 1 分钟最多缩 20%
+          periodSeconds: 60

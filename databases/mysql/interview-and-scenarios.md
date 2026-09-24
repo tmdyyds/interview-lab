@@ -7,10 +7,7 @@ MySQL 是后端面试的必考大项。本文覆盖两部分：
 1. **60 道高频面试题**（按存储引擎/索引 / 事务 / 锁 / 日志 / 主从 / SQL 优化 6 大类分组）
 2. **10 个生产场景的解决方案**（真实案例 + SQL / Go 实现）
 
-配套阅读（后续补充）：
-- 分库分表专题
-- MVCC 深度剖析
-- 死锁诊断实战
+> 💡 遇到概念模糊时，跳去 [**core-knowledge.md**](./core-knowledge.md) 查底层原理——那份文档系统梳理了 InnoDB 内存/磁盘结构、Page 与行格式、B+ 树物理组织、MVCC 深度、Next-Key Lock 加锁规则、两阶段提交、优化器 Cost Model、调优参数速查等。本文侧重**考点问答**，那边侧重**结构与原理**。
 
 ---
 
@@ -1753,6 +1750,7 @@ DB 层用乐观锁最终校验，即使前面失守也不会超卖。见 `system
 
 ### 相关文档
 
+- [core-knowledge.md](./core-knowledge.md) — MySQL 核心知识全景（架构 / 内存 / MVCC / 锁 / 日志 / 优化器 / 调优）
 - `system-design/distributed/transactions.md` — 分布式事务方案
 - `databases/redis/interview-and-scenarios-go.md` — Redis 面试题
 - `system-design/cases/` — 秒杀、订单幂等等场景设计

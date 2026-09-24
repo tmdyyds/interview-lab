@@ -1,0 +1,30 @@
+# PodDisruptionBudget（PDB）：主动驱逐时的可用性保障。
+#
+# 什么是"主动驱逐"（voluntary disruption）？
+#   - 节点维护（kubectl drain）
+#   - 集群缩容
+#   - kube-scheduler 的重调度
+#   - Cluster Autoscaler 缩节点
+#
+# 什么是 PDB 不管的"非主动驱逐"？
+#   - 节点直接宕机、断电
+#   - OOMKilled、进程 crash
+#   - 硬件故障
+# 这些场景要靠多副本 + 多可用区自身来对抗。
+#
+# 面试点：PDB 和 topologySpreadConstraints、多副本一起用，才是完整的高可用方案。
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: go-k8s-demo
+  namespace: demo
+spec:
+  # minAvailable 和 maxUnavailable 二选一：
+  #   minAvailable: 2          → 任何时候至少 2 个 Pod 可用
+  #   maxUnavailable: 25%      → 任何时候最多 25% Pod 不可用
+  # 副本数会变化的服务建议用百分比。
+  minAvailable: 2
+
+  selector:
+    matchLabels:
+      app: go-k8s-demo

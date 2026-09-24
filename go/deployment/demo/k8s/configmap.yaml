@@ -1,0 +1,21 @@
+# ConfigMap 保存非敏感配置。
+#
+# 面试点：为什么不把配置写在镜像里？
+#   - 一份镜像要在 dev / staging / prod 复用，配置必须外置
+#   - 改配置不用重建镜像，只需要滚动重启 Pod
+#   - 敏感数据走 Secret，日常配置走 ConfigMap，分开管理
+#
+# 消费方式：
+#   1) envFrom：把整个 ConfigMap 变成环境变量（本 demo 采用）
+#   2) volumeMount：挂成文件，适合大段 YAML/JSON 配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: go-k8s-demo-config
+  namespace: demo
+data:
+  APP_ENV: "prod"
+  PORT: "8080"
+  # 更多可选项可以往下加，比如：
+  # LOG_LEVEL: "info"
+  # DB_HOST: "mysql.data.svc.cluster.local"

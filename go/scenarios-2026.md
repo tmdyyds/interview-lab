@@ -29,6 +29,7 @@
 19. [平滑重启：零停机部署](#19-平滑重启零停机部署)
 20. [链路追踪：TraceID 传递](#20-链路追踪traceid-传递)
 21. [MySQL 分库分表方案](#21-mysql-分库分表方案)
+22. [异步发送短信服务](#22-异步发送短信服务)
 
 ---
 
@@ -2579,3 +2580,406 @@ user_id % 128 = 42 的用户，在 mod 256 下：
 MySQL InnoDB B+ 树 3 层能存约 2000 万行（16KB 页 + 主键 8 字节假设），查询走 3 次磁盘 IO。超过 5000 万 B+ 树可能 4 层，性能下降。
 
 也是经验值，实际根据行大小可以差别很大。
+
+---
+
+## 22. 异步发送短信服务
+
+### 场景
+
+业务需要发短信（注册验证码、支付通知、营销推送）。要求：
+
+- **接口毫秒返回**：不能让用户在下单页等短信通道商响应（可能 500ms ~ 3s）。
+- **抗峰值**：秒杀开始瞬间 10 万人请求验证码。
+- **QPS 上限**：短信通道商合同 200 QPS，超了要么被限流要么被拉黑。
+- **不能重复**：短信按条计费，一条重发一次就是钱；同一手机号 60s 内不能骚扰。
+- **失败重试 + 死信**：网络抖动要重试，反复失败要能人工兜底。
+- **进程重启不丢消息**：K8s 滚动发布时正在处理的验证码不能丢。
+
+### 考察点
+
+生产者/消费者、MQ 削峰、Worker Pool、Redis 原子频控、`rate.Limiter`、`gobreaker` 熔断、幂等、优雅关闭、DLQ。
+
+### 答案
+
+#### 架构分层
+
+```
+业务方 ──HTTP──> SMSService.Send()          （同步：校验/频控/幂等/投 MQ，< 20ms 返回）
+                       │
+                       ▼
+                     Kafka Topic（按优先级分：sms.verify / sms.notify / sms.marketing）
+                       │
+                       ▼
+                  SMSWorker Pool           （异步：限流/熔断/重试）
+                       │
+                       ├──> 阿里云短信 SDK （主通道）
+                       ├──> 腾讯云短信 SDK （备通道，主通道熔断时切）
+                       └──> DLQ Topic     （最终失败进死信）
+```
+
+#### Producer：同步入口
+
+```go
+type SendReq struct {
+    Phone    string            // 手机号（E.164 格式）
+    Template string            // 模板 ID
+    Params   map[string]string // 模板参数
+    BizID    string            // 业务方生成的幂等 ID（必填）
+    Priority int               // 0=验证码, 1=通知, 2=营销
+}
+
+type SMSService struct {
+    redis    *redis.Client
+    producer sarama.SyncProducer
+    logger   *slog.Logger
+}
+
+// 频控 Lua：60s 内 1 条，24h 内 5 条
+const freqLimitScript = `
+local minKey, dayKey = KEYS[1], KEYS[2]
+local minLimit, dayLimit = tonumber(ARGV[1]), tonumber(ARGV[2])
+
+if tonumber(redis.call('GET', minKey) or '0') >= minLimit then
+    return -1
+end
+if tonumber(redis.call('GET', dayKey) or '0') >= dayLimit then
+    return -2
+end
+redis.call('INCR', minKey)
+redis.call('EXPIRE', minKey, 60)
+redis.call('INCR', dayKey)
+redis.call('EXPIRE', dayKey, 86400)
+return 1
+`
+
+func (s *SMSService) Send(ctx context.Context, req *SendReq) error {
+    // 1. 参数校验（快速失败，防脏数据进 MQ）
+    if !isValidPhone(req.Phone) {
+        return ErrInvalidPhone
+    }
+    if req.BizID == "" {
+        return ErrMissingBizID
+    }
+
+    // 2. 幂等：同 BizID 24h 内只处理一次
+    ok, err := s.redis.SetNX(ctx, "sms:idem:"+req.BizID, 1, 24*time.Hour).Result()
+    if err != nil {
+        return fmt.Errorf("idem check: %w", err)
+    }
+    if !ok {
+        s.logger.Info("duplicate submit", "biz_id", req.BizID)
+        return nil // 幂等：静默成功
+    }
+
+    // 3. 频控（验证码通常不做用户频控，由发码策略控制；通知/营销必做）
+    if req.Priority > 0 {
+        result, err := s.redis.Eval(ctx, freqLimitScript,
+            []string{"sms:freq:min:" + req.Phone, "sms:freq:day:" + req.Phone},
+            1, 5,
+        ).Int()
+        if err != nil {
+            return fmt.Errorf("freq limit: %w", err)
+        }
+        switch result {
+        case -1:
+            return ErrTooFrequent
+        case -2:
+            return ErrDailyLimitReached
+        }
+    }
+
+    // 4. 投 MQ（不同优先级不同 topic，验证码不被营销挤压）
+    payload, _ := json.Marshal(req)
+    topic := topicByPriority(req.Priority)
+    _, _, err = s.producer.SendMessage(&sarama.ProducerMessage{
+        Topic: topic,
+        Key:   sarama.StringEncoder(req.BizID), // 同 BizID 落同一分区，保证顺序
+        Value: sarama.ByteEncoder(payload),
+    })
+    return err
+}
+```
+
+#### Consumer：Worker Pool + 限流 + 熔断
+
+```go
+type SMSChannel interface {
+    Send(ctx context.Context, phone, template string, params map[string]string) error
+}
+
+type SMSWorker struct {
+    consumer sarama.ConsumerGroup
+    primary  SMSChannel // 主通道
+    backup   SMSChannel // 备通道
+    limiter  *rate.Limiter
+    breaker  *gobreaker.CircuitBreaker
+    slots    chan struct{}     // worker 并发槽
+    inflight sync.WaitGroup    // 追踪在飞消息，用于优雅关闭
+    dlq      sarama.SyncProducer
+    logger   *slog.Logger
+}
+
+func NewSMSWorker(cfg WorkerConfig) *SMSWorker {
+    return &SMSWorker{
+        consumer: cfg.Consumer,
+        primary:  cfg.Primary,
+        backup:   cfg.Backup,
+        // 全局 QPS 限流，保护下游通道商（合同 200 QPS，留 buffer 到 180）
+        limiter: rate.NewLimiter(180, 200),
+        breaker: gobreaker.NewCircuitBreaker(gobreaker.Settings{
+            Name:        "sms-primary",
+            MaxRequests: 3,
+            Interval:    10 * time.Second,
+            Timeout:     30 * time.Second,
+            ReadyToTrip: func(c gobreaker.Counts) bool {
+                return c.Requests >= 20 &&
+                    float64(c.TotalFailures)/float64(c.Requests) > 0.5
+            },
+        }),
+        slots: make(chan struct{}, cfg.Concurrency), // 例如 50
+        dlq:   cfg.DLQ,
+    }
+}
+
+// 实现 sarama.ConsumerGroupHandler
+func (w *SMSWorker) ConsumeClaim(sess sarama.ConsumerGroupSession,
+    claim sarama.ConsumerGroupClaim) error {
+
+    for msg := range claim.Messages() {
+        // 抢 worker slot（阻塞 = 天然反压：MQ 拉太快，这里会阻塞不 poll 下一条）
+        select {
+        case w.slots <- struct{}{}:
+        case <-sess.Context().Done():
+            return nil
+        }
+
+        w.inflight.Add(1)
+        go func(m *sarama.ConsumerMessage) {
+            defer w.inflight.Done()
+            defer func() { <-w.slots }()
+
+            if w.process(sess.Context(), m) {
+                sess.MarkMessage(m, "") // 只有成功才 commit offset
+            }
+        }(msg)
+    }
+    return nil
+}
+
+// process 返回 true 表示 commit offset（成功或已进 DLQ），false 表示保留 offset 等下次重投
+func (w *SMSWorker) process(ctx context.Context, msg *sarama.ConsumerMessage) bool {
+    var req SendReq
+    if err := json.Unmarshal(msg.Value, &req); err != nil {
+        w.logger.Error("bad payload", "err", err, "offset", msg.Offset)
+        return true // 脏数据直接跳过，不然会永远卡住
+    }
+
+    log := w.logger.With("biz_id", req.BizID, "phone", maskPhone(req.Phone))
+
+    // 全局限流：Wait 会阻塞直到拿到令牌
+    if err := w.limiter.Wait(ctx); err != nil {
+        return false // ctx 取消，保留 offset
+    }
+
+    // 熔断保护主通道
+    start := time.Now()
+    _, err := w.breaker.Execute(func() (any, error) {
+        return nil, w.primary.Send(ctx, req.Phone, req.Template, req.Params)
+    })
+    smsLatency.WithLabelValues(req.Template).Observe(time.Since(start).Seconds())
+
+    if err == nil {
+        smsSuccess.WithLabelValues(req.Template).Inc()
+        return true
+    }
+
+    // 主通道熔断中：走备通道（不再进熔断器统计）
+    if errors.Is(err, gobreaker.ErrOpenState) {
+        log.Warn("primary breaker open, fallback to backup")
+        if berr := w.backup.Send(ctx, req.Phone, req.Template, req.Params); berr == nil {
+            smsSuccess.WithLabelValues(req.Template).Inc()
+            return true
+        } else {
+            err = berr
+        }
+    }
+
+    smsFailure.WithLabelValues(req.Template, classify(err)).Inc()
+
+    // 重试次数：Kafka Header 里记（Kafka 本身没有 delivery-count）
+    retry := getRetryCount(msg) + 1
+    if retry >= 3 {
+        log.Error("max retry, send to DLQ", "err", err)
+        w.sendToDLQ(msg, err)
+        return true
+    }
+
+    // 重投带上 retry 计数（生产用带延迟的 topic，如 sms.retry.30s / 5m / 30m）
+    w.reQueue(msg, retry)
+    return true
+}
+```
+
+#### 优雅关闭
+
+```go
+func main() {
+    logger := slog.Default()
+    worker := NewSMSWorker(loadConfig())
+
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    // 启动消费
+    done := make(chan error, 1)
+    go func() {
+        for {
+            if err := worker.consumer.Consume(ctx, []string{
+                "sms.verify", "sms.notify", "sms.marketing",
+            }, worker); err != nil {
+                if errors.Is(err, context.Canceled) {
+                    done <- nil
+                    return
+                }
+                logger.Error("consume", "err", err)
+                time.Sleep(time.Second) // 简单退避重连
+            }
+        }
+    }()
+
+    // 监听退出信号
+    sig := make(chan os.Signal, 1)
+    signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+    <-sig
+    logger.Info("shutdown signal received")
+
+    // 1. cancel → ConsumeClaim 的 for range 会退出（rebalance 也会退出）
+    cancel()
+
+    // 2. 等在飞消息处理完（最多 30s，K8s terminationGracePeriodSeconds 给 60s）
+    doneCh := make(chan struct{})
+    go func() {
+        worker.inflight.Wait()
+        close(doneCh)
+    }()
+    select {
+    case <-doneCh:
+        logger.Info("all in-flight messages processed")
+    case <-time.After(30 * time.Second):
+        logger.Warn("shutdown timeout, some messages may be reprocessed")
+    }
+
+    _ = worker.consumer.Close()
+    <-done
+}
+```
+
+### 深度剖析
+
+#### 为什么必须走 MQ
+
+- **接口响应时间**：短信通道商 P99 可能 1s+，同步等会把连接池打爆。走 MQ 后接口 < 20ms 返回。
+- **削峰**：秒杀瞬间 10 万请求，直接打通道商必被限流。MQ 里排队，Worker 按 180 QPS 均匀消费。
+- **解耦**：通道商挂了不影响业务下单，消息在 MQ 里等恢复。
+
+**替代方案对比**：
+
+| 方案 | 优点 | 缺点 | 适合 |
+|-----|------|------|------|
+| 进程内 channel + Worker Pool | 简单，无外部依赖 | 进程挂消息丢；单机容量上限 | 小规模、对丢消息不敏感 |
+| Redis Stream / List | 轻量，运维简单 | 消费者 offset 管理麻烦；无严格顺序保证 | 中等规模 |
+| Kafka / RocketMQ | 可靠、高吞吐、可回放 | 运维成本高 | 生产首选 |
+
+#### 幂等和频控的区别
+
+**别混淆**：
+
+- **幂等（BizID）**：解决"消息重复投递"问题。MQ 至少投一次，同一 BizID 可能被 Producer 或 Consumer 处理多次，`SetNX` 保证只发一条。粒度 = 一次业务请求。
+- **频控（Phone）**：解决"用户被骚扰"问题。同一手机号 60s 只能收 1 条、24h 5 条，是业务规则。粒度 = 一个手机号。
+
+两者都用 Redis，但 key 和过期时间完全不同。
+
+#### Worker Pool 的关键细节
+
+```go
+select {
+case w.slots <- struct{}{}:  // 抢槽阻塞 = 反压
+case <-sess.Context().Done():
+    return nil
+}
+```
+
+`slots` channel 满了会**阻塞 for range，从而不 poll 下一条消息** —— 这是最简单也最有效的**反压机制**。不需要复杂的信号量或队列长度检测。
+
+**为什么不为每条消息 `go func`**：会瞬间起几万 goroutine，把内存和下游都打爆。Worker 数 = 通道商 QPS × 平均耗时（Little's Law），200 QPS × 0.2s = 40 个够了，设 50 留 buffer。
+
+#### 限流和熔断的分工
+
+- **`rate.Limiter`（180 QPS）**：**保护下游**。合同 200 QPS，留 10% buffer 应对时钟抖动。这是"我不发太快"。
+- **`gobreaker`（失败率 50%）**：**保护自己**。下游挂了后立刻停手，切备用通道；30s 后半开探测，避免打无谓的调用。这是"你挂了我不硬撑"。
+
+两者互补：限流是**主动**流量整形，熔断是**被动**故障响应。
+
+#### 优先级分 topic 而不是分 priority 字段
+
+如果所有短信混一个 topic，营销短信积压 100 万条时，验证码要排在后面 → **用户点了发码等半小时**。
+
+分 3 个 topic：
+- `sms.verify`：单独消费组，配 30 个 worker，最高优先级。
+- `sms.notify`：中等资源。
+- `sms.marketing`：可以慢慢发，晚上跑，甚至限速。
+
+不同 topic 独立消费、独立限流、独立配置。
+
+#### 死信和补偿
+
+- **重试策略**：MQ 立刻重投会连续失败。业界做法是**延迟重试**：`sms.retry.30s` → `sms.retry.5m` → `sms.retry.30m`，用 RocketMQ 延迟级别或 Kafka 加消费端 delay。
+- **DLQ 处理**：进死信的消息必须有值班盯着（告警接钉钉/PagerDuty），人工判断：
+  - 是号码问题（黑名单）→ 丢弃 + 加黑名单表。
+  - 是通道问题 → 换通道重发。
+  - 是模板问题 → 修模板重发。
+
+#### 优雅关闭要处理的三件事
+
+1. **不再拉新消息**：`cancel()` 后 `Consume` 返回。
+2. **在飞消息处理完**：`inflight.Wait()`，超时 30s（略小于 K8s `terminationGracePeriodSeconds`）。
+3. **超时兜底**：处理不完的消息不 commit offset，rebalance 后另一个 Pod 会重投（此时幂等 key 生效，不会重复发送）。
+
+#### 生产还需要的东西
+
+- **多通道路由**：主备通道 + 按运营商路由（移动走 A、联通走 B），成本和到达率都能优化。
+- **发送流水表**：MySQL 记 `biz_id/phone/template/status/channel_msg_id/created_at`，通道回调后更新 `status`（DELIVERED/FAILED）。
+- **对账**：每天和通道商对账单，防止计费和实际发送数量对不上。
+- **监控指标**：
+  - `sms_send_total{template, status}` — 总量和成功率
+  - `sms_channel_latency` — 通道耗时分布
+  - `sms_queue_lag` — MQ 积压量
+  - `sms_breaker_state` — 熔断器状态
+- **敏感数据**：日志里手机号必须脱敏（`138****1234`），验证码内容不能落日志，符合合规要求。
+
+#### 高频追问
+
+**Q1：为什么不用 Redis Stream 代替 Kafka？**
+
+小规模可以（Redis Stream 有 consumer group 和 ACK）。规模大了后：吞吐、持久化、多副本、跨机房容灾，Kafka/RocketMQ 更成熟。选型看数据量和运维能力。
+
+**Q2：Kafka 消息顺序问题会不会影响短信？**
+
+短信业务**不需要严格顺序**（每条消息独立）。如果非要顺序（比如"先发通知再发确认"），把两条消息的 key 设成一样（用 phone 或 biz_id），Kafka 保证同 key 落同分区、同分区内有序。
+
+**Q3：如果 Redis 幂等 key 挂了/清了怎么办？**
+
+幂等的最后一道防线是**通道商侧**：阿里云、腾讯云的 SDK 都支持传 `OutId`（外部业务 ID），通道商侧做去重，24 小时内同 OutId 只发一次。所以 `BizID` 要透传到通道商。
+
+**Q4：验证码发不出去业务方怎么感知？**
+
+同步接口只保证"进 MQ 成功"，不保证"发送成功"。业务方需要：
+- **推送状态**：Worker 发送后回调业务方接口（可靠但耦合）。
+- **查询接口**：业务方主动查 `GET /sms/status/{bizID}`（松耦合，推荐）。
+- **超时兜底**：60s 内没收到验证码，前端允许"重新发送"（此时新 BizID，前一条丢弃即可）。
+
+**Q5：一个 Worker Pod 挂了会丢消息吗？**
+
+不会。Kafka 消费是"处理成功后 commit offset"，Pod 崩溃时未 commit 的消息会被 rebalance 到其他 Pod 重新处理。前提是：**幂等做对了**，同一消息被处理两次不能真的发两条短信 —— 这就是为什么 `BizID` 幂等是必须的。
+

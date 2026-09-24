@@ -1,0 +1,216 @@
+# ============================================================================
+# Deployment：无状态服务的最主流部署方式
+# 面试考察点密度最高的一份 YAML，几乎每一行都对应一个知识点。
+# ============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-k8s-demo
+  namespace: demo
+  labels:
+    app: go-k8s-demo
+spec:
+  # ------------------------------------------------------------------
+  # 副本数
+  # ------------------------------------------------------------------
+  # 至少 2 副本才能做到"任意单点故障不影响可用性"。
+  # 生产建议 3+：单可用区挂掉时还剩 2 个。
+  replicas: 3
+
+  # ------------------------------------------------------------------
+  # 滚动升级策略
+  # ------------------------------------------------------------------
+  # RollingUpdate 是默认策略：新旧版本同时存在一段时间，逐步替换。
+  # 另一种是 Recreate：先全删旧再起新，会有停机；只有强状态要求时才用。
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxSurge：升级过程中允许"超出 replicas"的最大 Pod 数
+      # maxUnavailable：升级过程中允许"不可用"的最大 Pod 数
+      # 两个值一起决定滚动升级的速度和风险：
+      #   激进（快，风险高）：maxSurge=50%, maxUnavailable=0
+      #   保守（稳，慢）：    maxSurge=1,   maxUnavailable=0
+      maxSurge: 1
+      maxUnavailable: 0     # 0 = 零停机滚动，任何时候可用副本都 >= replicas
+
+  # 保留最近几次 ReplicaSet，rollback 时可以 `kubectl rollout undo`。
+  # 太大会占 etcd 存储，10 以内即可。
+  revisionHistoryLimit: 5
+
+  # 等待 Pod 就绪多久算"部署成功"，避免 CI 里立刻判成功但实际还没起来
+  progressDeadlineSeconds: 600
+
+  selector:
+    matchLabels:
+      app: go-k8s-demo
+
+  template:
+    metadata:
+      labels:
+        app: go-k8s-demo
+        version: v1
+      annotations:
+        # 非 Prometheus Operator 环境下，通过 Pod annotation 让采集器发现指标
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      # ------------------------------------------------------------------
+      # 停机相关
+      # ------------------------------------------------------------------
+      # SIGTERM 到 SIGKILL 的宽限时间。
+      # 必须 > 应用里的（drain sleep + shutdown timeout），否则来不及优雅退出就被强杀。
+      # 我们的 Go 代码是 5s drain + 25s shutdown = 30s，这里给 60s 留缓冲。
+      terminationGracePeriodSeconds: 60
+
+      # ------------------------------------------------------------------
+      # Pod 级安全上下文
+      # ------------------------------------------------------------------
+      securityContext:
+        runAsNonRoot: true         # 强制不能用 root 跑，即使镜像里 USER 是 root 也会启动失败
+        runAsUser: 65532           # distroless nonroot 用户
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault     # 用 runtime 默认的 seccomp profile，屏蔽危险 syscall
+
+      # 生产环境镜像仓库通常需要认证，用 imagePullSecrets 引用一个 docker-registry 类型的 Secret：
+      # imagePullSecrets:
+      #   - name: harbor-cred
+
+      containers:
+        - name: server
+          image: go-k8s-demo:latest
+          # imagePullPolicy 说明：
+          #   Always      每次拉，用于 :latest 或不可信 tag
+          #   IfNotPresent 本地有就用本地，默认策略
+          #   Never       只用本地（本地开发时避免联网拉取）
+          # 生产建议用 SHA digest（image@sha256:xxx）+ IfNotPresent，保证内容不可变
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http           # 端口起名字，其它地方用 name 引用，改端口更方便
+              containerPort: 8080
+              protocol: TCP
+
+          # ----------------------------------------------------------
+          # 配置注入：ConfigMap + Secret 全部变成环境变量
+          # ----------------------------------------------------------
+          envFrom:
+            - configMapRef:
+                name: go-k8s-demo-config
+            - secretRef:
+                name: go-k8s-demo-secret
+
+          # ----------------------------------------------------------
+          # 资源规格（面试必问）
+          # ----------------------------------------------------------
+          # requests：
+          #   - 调度器按这个找有足够余量的节点
+          #   - HPA 按这个算 CPU/内存利用率（averageUtilization 基准）
+          # limits：
+          #   - CPU 超限 → 被 CFS 限流（throttle），进程"变慢"
+          #   - 内存超限 → OOMKilled，Pod 直接重启
+          #
+          # 生产常见坑：
+          #   - CPU limits 设得太紧会导致 GC/编译等突发 CPU 被 throttle，
+          #     很多团队选择"只设 CPU requests、不设 CPU limits"
+          #   - 内存 limits 必须严格设置，否则一个 Pod 内存泄漏能把整个 node 打爆
+          resources:
+            requests:
+              cpu: "200m"          # 0.2 核
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"         # 1 核
+              memory: "256Mi"
+
+          # ----------------------------------------------------------
+          # 三种探针（面试重点）
+          # ----------------------------------------------------------
+          # startupProbe：启动探针。慢启动应用（比如 Java）用它，
+          #   探针通过前 liveness/readiness 都不生效。
+          #   Go 服务通常启动很快（毫秒级），可以省略。
+          # startupProbe:
+          #   httpGet: { path: /healthz, port: http }
+          #   failureThreshold: 30
+          #   periodSeconds: 2
+
+          # livenessProbe：只判断"进程活着"，失败会重启容器。
+          # 铁律：不要在这里探外部依赖，否则依赖抖动会引发全局重启雪崩。
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10   # 等 10 秒再开始探（给启动留时间）
+            periodSeconds: 10         # 每 10 秒探一次
+            timeoutSeconds: 2         # 单次探测超时
+            failureThreshold: 3       # 连续 3 次失败才判定为不健康
+            successThreshold: 1
+
+          # readinessProbe：判断"能否接流量"，失败只是从 Service endpoints 摘除，不重启。
+          # 相比 liveness 应该更敏感（周期更短、阈值更严）。
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+            successThreshold: 1
+
+          # ----------------------------------------------------------
+          # lifecycle 钩子
+          # ----------------------------------------------------------
+          # 说明：本 demo 的 Go 代码里已经处理了"关 readiness → sleep → shutdown"的流程，
+          # 所以不需要 preStop。这里保留完整注释供参考。
+          #
+          # 如果 Go 代码没做这套处理，可以用 preStop 来补：
+          # lifecycle:
+          #   preStop:
+          #     exec:
+          #       # 需要 base 镜像有 sh，distroless 不行，得换成 alpine
+          #       command: ["/bin/sh", "-c", "sleep 5"]
+          #   # 或者用 httpGet 触发应用自己的 /shutdown 端点：
+          #   # preStop:
+          #   #   httpGet: { path: /shutdown, port: http }
+
+          # ----------------------------------------------------------
+          # 容器级安全上下文
+          # ----------------------------------------------------------
+          securityContext:
+            readOnlyRootFilesystem: true      # 根目录只读，攻击者进来也没法写马
+            allowPrivilegeEscalation: false   # 禁止 setuid 提权
+            capabilities:
+              drop:
+                - ALL                          # 丢弃所有 Linux capability
+
+          # 只读根文件系统下，还需要临时目录写日志/上传，用 emptyDir 挂 /tmp
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi      # 限制大小，防止本地日志写爆 node 磁盘
+
+      # ------------------------------------------------------------------
+      # 拓扑分布约束：让 Pod 分散到不同可用区/节点
+      # ------------------------------------------------------------------
+      # maxSkew=1 表示"任意两个拓扑域之间 Pod 数量差不超过 1"。
+      # whenUnsatisfiable=ScheduleAnyway：调度不下时降级放宽，避免 Pod 卡 Pending。
+      # 严格场景可以用 DoNotSchedule，但要保证节点/可用区充足。
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: go-k8s-demo
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: go-k8s-demo
